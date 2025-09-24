@@ -1,0 +1,25 @@
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:                    cdi   R-squared:                       0.434
+Model:                            OLS   Adj. R-squared:                  0.401
+Method:                 Least Squares   F-statistic:                     14.32
+Date:                Wed, 24 Sep 2025   Prob (F-statistic):            0.00148
+Time:                        00:12:30   Log-Likelihood:                 24.807
+No. Observations:                  19   AIC:                            -45.61
+Df Residuals:                      17   BIC:                            -43.72
+Df Model:                           1                                         
+Covariance Type:                  HC1                                         
+==============================================================================
+                 coef    std err          z      P>|z|      [0.025      0.975]
+------------------------------------------------------------------------------
+const          0.4933      0.016     31.018      0.000       0.462       0.524
+std_wt_z      -0.0574      0.015     -3.784      0.000      -0.087      -0.028
+==============================================================================
+Omnibus:                        0.960   Durbin-Watson:                   0.696
+Prob(Omnibus):                  0.619   Jarque-Bera (JB):                0.769
+Skew:                          -0.151   Prob(JB):                        0.681
+Kurtosis:                       2.062   Cond. No.                         1.00
+==============================================================================
+
+Notes:
+[1] Standard Errors are heteroscedasticity robust (HC1)
