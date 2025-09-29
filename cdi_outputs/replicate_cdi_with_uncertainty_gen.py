@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-replicate_cdi_with_uncertainty_gen.py
+replicate_cdi_with_uncertainty_gen_with_pca.py
 
-Generates model_uncertainty.csv from your close_prices.csv (if not present) by:
- - computing month-end returns
- - using rolling-window AR(1) one-step-ahead forecasts to produce forecast errors
- - computing rolling RMSE of forecast errors per ticker (SE_t per ticker)
- - aggregating SE_t across tickers by cross-sectional mean -> SE_t (single series)
- - computing wt_t = Sigma_t / (SE_t^2 + Sigma_t) where Sigma_t = cumulative mean(SE^2)
- - computing 24-month rolling std of wt_t
-
-Merges generated model_uncertainty with cdi_timeseries_monthly.csv and runs regression:
-   CDI_t ~ 1 + std_wt_24m
+Generates model_uncertainty.csv (SE_t, wt_t, std_wt_24m) from close_prices,
+and optionally augments/replaces the uncertainty proxy with a PCA-based
+measure (pc1_crosssec_std -> std_pc1_24m) if pca_outputs/pc1_crosssec_std.csv exists.
 
 Outputs (OUT_DIR):
  - model_uncertainty.csv
- - cdi_wt_merged.csv
- - regression_results.txt
+ - cdi_wt_merged.csv (and cdi_wt_merged_with_pc1.csv when PCA present)
+ - regression_results_using_pc1_or_stdwt.txt (or regression_results.txt)
  - plot_cdi_vs_stdwt_scatter.png
  - plot_cdi_vs_stdwt.png
+
+Usage:
+    python replicate_cdi_with_uncertainty_gen_with_pca.py
 """
 
 import os
@@ -29,50 +25,50 @@ import statsmodels.api as sm
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-# ----------------- user config -----------------
-CLOSES_CSV = r"C:\Users\yaxib\OneDrive\Desktop\Python\cdi_outputs\close_prices.csv"                      # your close prices CSV (modify if needed)
-CDI_MONTHLY_CSV = r"C:\Users\yaxib\OneDrive\Desktop\Python\cdi_outputs\cdi_timeseries_monthly.csv"         # your monthly CDI CSV
-MODEL_UNC_CSV = "model_uncertainty.csv"               # will be created if missing
+# ----------------- user config (edit as needed) -----------------
+# input files
+CLOSES_CSV = r"cdi_outputs/close_prices.csv"   # path to your closes (wide or long)
+CDI_MONTHLY_CSV = r"cdi_outputs/cdi_timeseries_monthly.csv"  # monthly CDI
+# PCA input (optional)
+PC1_STD_CSV = r"pca_outputs/pc1_crosssec_std.csv"  # produced by run_pca_on_cdi_outputs.py
+# outputs
+MODEL_UNC_CSV = "model_uncertainty.csv"   # saved in working dir
 OUT_DIR = "cdi_paper_replication_outputs"
+
 TICKERS = ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","JPM","JNJ","PG"]
 
-# Rolling windows (months)
-AR_ROLL_WINDOW = 12           # window to fit AR(1) and compute forecast errors
-SE_ROLL_WINDOW = 24           # window to compute RMSE of errors (can be same as AR_ROLL_WINDOW)
-ROLL_STD_WINDOW = 12          # 24-month rolling std for w_t
-MIN_PERIODS_ROLL_STD = 12
-MIN_FIRMS_FOR_SE_MEAN = 1     # require at least this many tickers to average SE across tickers
-# ------------------------------------------------
+# Rolling windows and thresholds
+AR_ROLL_WINDOW = 12           # months to fit AR(1)
+SE_ROLL_WINDOW = 24           # months for RMSE of errors (SE)
+ROLL_STD_WINDOW = 24          # months for rolling std of wt (paper uses 24)
+MIN_PERIODS_ROLL_STD = 12     # min periods for rolling std
+MIN_FIRMS_FOR_SE_MEAN = 1     # min tickers to average SE across tickers
+MIN_OBS_FOR_REG = 6           # min monthly obs to run regression
 
+# PCA fallback windows (try these in order to build std_pc1)
+PCA_ROLL_WINDOWS_TRY = [24, 12, 6]
+PCA_MIN_PERIODS_TRY = [12, 6, 3]
+
+# -----------------------------------------------------------------
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ---------- helpers ----------
+# ---------- helper functions ----------
 def read_close_prices(path):
-    """
-    Read close_prices CSV. Supports:
-     - wide format: Date + ticker columns
-     - long format: Date, ticker, close
-    Returns DataFrame indexed by Date with columns = uppercase tickers.
-    """
     raw = pd.read_csv(path)
     cols_lower = {c.lower(): c for c in raw.columns}
-    # detect date column
     if 'date' in cols_lower:
         date_col = cols_lower['date']
         raw[date_col] = pd.to_datetime(raw[date_col])
         raw = raw.rename(columns={date_col: 'Date'})
     else:
-        # try first column as date
         first = raw.columns[0]
         try:
             raw[first] = pd.to_datetime(raw[first])
             raw = raw.rename(columns={first: 'Date'})
         except Exception:
             raise ValueError("Could not detect a Date column in close_prices.csv")
-    # Wide format?
     upper_cols = [c.upper() for c in raw.columns]
     if all(t in upper_cols for t in TICKERS):
-        # pick Date + columns that match tickers
         mapping = {}
         for c in raw.columns:
             if c.upper() in TICKERS:
@@ -83,7 +79,6 @@ def read_close_prices(path):
         df.columns = [c.upper() for c in df.columns]
         df = df.reindex(columns=TICKERS)
         return df
-    # Long format?
     if 'ticker' in (c.lower() for c in raw.columns) or 'symbol' in (c.lower() for c in raw.columns):
         name_map = {c.lower(): c for c in raw.columns}
         ticker_col = name_map.get('ticker', name_map.get('symbol'))
@@ -101,7 +96,6 @@ def read_close_prices(path):
         pivot = pivot.reindex(columns=TICKERS)
         pivot = pivot.sort_index()
         return pivot
-    # fallback: try columns containing ticker substring
     col_map = {}
     for c in raw.columns:
         for t in TICKERS:
@@ -117,12 +111,9 @@ def read_close_prices(path):
     raise ValueError("Unrecognized close_prices.csv layout. Provide wide Date+tickers or long Date,ticker,close.")
 
 def month_end_prices(close_df):
-    """Return month-end prices (last available trading day of each month)."""
     close_df = close_df.copy()
     close_df.index = pd.to_datetime(close_df.index)
-    # groupby year-month and take last
     me = close_df.groupby([close_df.index.year, close_df.index.month]).apply(lambda g: g.iloc[-1])
-    # rebuild month-end dates
     me.index = pd.to_datetime([pd.Timestamp(year=int(y), month=int(m), day=1) + relativedelta(months=1) - pd.Timedelta(days=1)
                                for (y,m) in me.index])
     me.index.name = 'Date'
@@ -131,16 +122,11 @@ def month_end_prices(close_df):
     return me
 
 def monthly_returns_from_prices(month_end_df):
-    """Compute simple returns (P_t/P_{t-1} - 1) from month-end prices."""
     r = month_end_df.pct_change().dropna(how='all')
     r.index = pd.to_datetime(r.index.to_period('M').to_timestamp())
     return r
 
 def rolling_ar1_forecast_errors(series, window=AR_ROLL_WINDOW):
-    """
-    Rolling AR(1) one-step-ahead forecast errors.
-    Returns a Series of errors aligned to the original index (NaN where not computed).
-    """
     s = series.dropna().copy()
     if s.shape[0] < window + 1:
         return pd.Series(index=s.index, data=np.nan)
@@ -164,12 +150,39 @@ def rolling_ar1_forecast_errors(series, window=AR_ROLL_WINDOW):
     return errors
 
 def rolling_rmse_of_errors(err_series, window=SE_ROLL_WINDOW):
-    """Compute rolling RMSE of the forecast errors (window in months)."""
     sq = err_series.pow(2)
     rmse = sq.rolling(window=window, min_periods=1).mean().pow(0.5)
     return rmse
 
-# ---------- main ----------
+# PCA helper: attempt to build std_pc1_24m using a series and multiple roll windows
+def build_std_pc1_variant(pc1_df, windows_try=PCA_ROLL_WINDOWS_TRY, min_periods_try=PCA_MIN_PERIODS_TRY):
+    """
+    pc1_df: DataFrame with columns ['date','pc1_crosssec_std'] (date parsed)
+    returns: tuple (std_pc1_df, used_window, used_min_periods)
+      - std_pc1_df: DataFrame columns ['date','std_pc1_24m'] (name uses window chosen)
+    """
+    if pc1_df is None or pc1_df.empty:
+        return None, None, None
+    pc1 = pc1_df.copy()
+    pc1['date'] = pd.to_datetime(pc1['date']).dt.to_period('M').dt.to_timestamp('M')
+    pc1 = pc1.sort_values('date').set_index('date')
+    for w, mp in zip(windows_try, min_periods_try):
+        colname = f'std_pc1_{w}m'
+        s = pc1['pc1_crosssec_std'].rolling(window=w, min_periods=mp).std()
+        nonnull = s.notna().sum()
+        if nonnull >= MIN_OBS_FOR_REG:
+            out = s.reset_index().rename(columns={colname: 'std_pc1_24m'}).rename(columns={s.name: 'std_pc1_24m'})
+            # Actually s has name 'pc1_crosssec_std' so we reset differently:
+            out = s.reset_index().rename(columns={0: 'std_pc1_24m'})
+            # but safer:
+            out = pd.DataFrame({'date': s.index, 'std_pc1_24m': s.values})
+            return out, w, mp
+    # if none passed, return raw z-scored series as fallback (may be used)
+    raw = pc1.reset_index()[['date','pc1_crosssec_std']].copy()
+    raw['std_pc1_24m'] = (raw['pc1_crosssec_std'] - raw['pc1_crosssec_std'].mean()) / (raw['pc1_crosssec_std'].std(ddof=0) + 1e-12)
+    return raw[['date','std_pc1_24m']], None, None
+
+# ------------------ Main pipeline ------------------
 def main():
     print("Loading month-end prices from:", CLOSES_CSV)
     close_df = read_close_prices(CLOSES_CSV)
@@ -190,14 +203,14 @@ def main():
             continue
         series = monthly_rets[tkr].dropna()
         if series.shape[0] < AR_ROLL_WINDOW + 1:
-            print(f"Ticker {tkr} has {series.shape[0]} months < AR_ROLL_WINDOW+1 ({AR_ROLL_WINDOW+1}) — will produce sparse SEs.")
+            print(f"Ticker {tkr} has {series.shape[0]} months < AR_ROLL_WINDOW+1 ({AR_ROLL_WINDOW+1}) — SE will be sparse.")
         errs = rolling_ar1_forecast_errors(series, window=AR_ROLL_WINDOW)
         se_series = rolling_rmse_of_errors(errs, window=SE_ROLL_WINDOW)
         se_series.name = tkr
         se_tickers[tkr] = se_series
         print(f"Computed SE (ticker={tkr}) — {se_series.dropna().shape[0]} non-null rows")
 
-    # make unified DataFrame of SEs across tickers (align by month)
+    # unified DataFrame of SEs across tickers (align by month)
     se_df = pd.DataFrame(se_tickers)
     se_df = se_df.sort_index()
 
@@ -213,39 +226,31 @@ def main():
     sigma_cummean = se2.expanding(min_periods=1).mean()
     wt = sigma_cummean / (se2 + sigma_cummean)
     wt = wt.rename("wt")
-    # compute 24-month rolling std of wt
-    std_wt_24m = wt.rolling(window=ROLL_STD_WINDOW, min_periods=MIN_PERIODS_ROLL_STD).std().rename("std_wt_24m")
+    # compute rolling std of wt (ROLL_STD_WINDOW adjustable)
+    std_wt = wt.rolling(window=ROLL_STD_WINDOW, min_periods=MIN_PERIODS_ROLL_STD).std().rename("std_wt_24m")
 
-    # ---------- Robust creation of model_unc DataFrame ----------
-    model_unc = pd.concat([se_mean, wt, std_wt_24m], axis=1)
-    model_unc = model_unc.reset_index()  # index -> a column (named e.g. 'index' or the index name)
-    # robustly rename first column to 'date'
+    # create model_unc DataFrame robustly
+    model_unc = pd.concat([se_mean, wt, std_wt], axis=1)
+    model_unc = model_unc.reset_index()
     first_col = model_unc.columns[0]
     if first_col != 'date':
         model_unc = model_unc.rename(columns={first_col: 'date'})
-    # ensure datetime monthly-aligned
-    model_unc['date'] = pd.to_datetime(model_unc['date']).dt.to_period('M').dt.to_timestamp()
-    # make sure expected columns exist
+    model_unc['date'] = pd.to_datetime(model_unc['date']).dt.to_period('M').dt.to_timestamp('M')
     for col in ['se', 'wt', 'std_wt_24m']:
         if col not in model_unc.columns:
             model_unc[col] = np.nan
-    # reorder for readability
     model_unc = model_unc[['date', 'se', 'wt', 'std_wt_24m']]
     model_unc = model_unc.sort_values('date').reset_index(drop=True)
 
-    # debug print
     print("DEBUG model_unc columns:", list(model_unc.columns))
     print("DEBUG model_unc head:\n", model_unc.head().to_string(index=False))
-
-    # save model_unc CSV
     model_unc.to_csv(MODEL_UNC_CSV, index=False)
     print("Saved model_uncertainty.csv ->", MODEL_UNC_CSV)
 
-    # Next: load CDI monthly and merge, then run regression
+    # load CDI monthly
     print("Loading CDI monthly:", CDI_MONTHLY_CSV)
     cdi = pd.read_csv(CDI_MONTHLY_CSV)
-
-    # find date column name
+    # detect date and cdi columns
     date_col = None
     for c in cdi.columns:
         if c.lower().startswith('date') or c.lower().startswith('available'):
@@ -261,7 +266,6 @@ def main():
                 continue
     if date_col is None:
         raise ValueError("Could not find date column in CDI monthly CSV.")
-    # find CDI numeric column
     cdi_col = None
     for c in cdi.columns:
         if 'cdi' in c.lower() or 'spearman' in c.lower() or 'pearson' in c.lower():
@@ -272,40 +276,85 @@ def main():
         if not numeric_cols:
             raise ValueError("No numeric CDI column found in CDI CSV.")
         cdi_col = numeric_cols[0]
-
     cdi = cdi[[date_col, cdi_col]].rename(columns={date_col:'date', cdi_col:'cdi'})
-    cdi['date'] = pd.to_datetime(cdi['date']).dt.to_period('M').dt.to_timestamp()
-    model_unc['date'] = pd.to_datetime(model_unc['date']).dt.to_period('M').dt.to_timestamp()
+    cdi['date'] = pd.to_datetime(cdi['date']).dt.to_period('M').dt.to_timestamp('M')
 
+    # Merge original model_unc with CDI
     merged = pd.merge(cdi, model_unc[['date','se','wt','std_wt_24m']], on='date', how='left')
     merged.to_csv(os.path.join(OUT_DIR, "cdi_wt_merged.csv"), index=False)
     print("Saved merged file:", os.path.join(OUT_DIR, "cdi_wt_merged.csv"))
 
-    # regression on rows with both cdi and std_wt_24m
-    df_reg = merged.dropna(subset=['cdi','std_wt_24m']).copy()
-    if df_reg.empty:
-        print("No observations with both CDI and std_wt_24m. You can:")
-        print(" - lower MIN_PERIODS_ROLL_STD or MIN_FIRMS_FOR_SE_MEAN")
-        print(" - check monthly coverage of your close_prices and CDI")
+    # --- PCA integration (optional) ---
+    if os.path.exists(PC1_STD_CSV):
+        print("Found PCA pc1_crosssec_std file:", PC1_STD_CSV)
+        try:
+            pc1 = pd.read_csv(PC1_STD_CSV, parse_dates=['date'])
+        except Exception:
+            # try without parse_dates
+            pc1 = pd.read_csv(PC1_STD_CSV)
+            if 'date' in pc1.columns:
+                pc1['date'] = pd.to_datetime(pc1['date'])
+        # canonicalize columns
+        if pc1.shape[1] >= 2 and 'pc1_crosssec_std' not in pc1.columns:
+            pc1.columns = [pc1.columns[0], 'pc1_crosssec_std'] + list(pc1.columns[2:])
+        print("PC1 preview:")
+        print(pc1.head().to_string(index=False))
+        # build std_pc1_24m (tries multiple windows; falls back to z-scored raw)
+        std_pc1_df, used_w, used_mp = build_std_pc1_variant(pc1)
+        if std_pc1_df is None:
+            print("Could not build std_pc1_24m from PCA output.")
+            std_pc1_df = None
+        else:
+            print("Built std_pc1_24m: rows =", len(std_pc1_df), "used_window =", used_w, "used_min_periods =", used_mp)
+            std_pc1_df['date'] = pd.to_datetime(std_pc1_df['date']).dt.to_period('M').dt.to_timestamp('M')
+            merged = pd.merge(merged, std_pc1_df[['date','std_pc1_24m']], on='date', how='left')
+            merged.to_csv(os.path.join(OUT_DIR, "cdi_wt_merged_with_pc1.csv"), index=False)
+            print("Saved merged file with PCA predictor:", os.path.join(OUT_DIR, "cdi_wt_merged_with_pc1.csv"))
+    else:
+        print("PCA pc1 file not found; skipping PCA augmentation. Expected at:", PC1_STD_CSV)
+        std_pc1_df = None
+
+    # Choose regression predictor: prefer std_pc1_24m if available, else std_wt_24m
+    if 'std_pc1_24m' in merged.columns:
+        merged['std_unc_for_reg'] = merged['std_pc1_24m'].fillna(merged['std_wt_24m'])
+    else:
+        merged['std_unc_for_reg'] = merged['std_wt_24m']
+
+    # Save merged final debug
+    merged.to_csv(os.path.join(OUT_DIR, "cdi_wt_merged_final_debug.csv"), index=False)
+    print("Saved final merged debug file:", os.path.join(OUT_DIR, "cdi_wt_merged_final_debug.csv"))
+
+    # regression
+    df_reg = merged.dropna(subset=['cdi','std_unc_for_reg']).copy()
+    print("Observations available for regression:", len(df_reg))
+    if df_reg.empty or len(df_reg) < MIN_OBS_FOR_REG:
+        print(f"No/too few observations for regression (need at least {MIN_OBS_FOR_REG}).")
+        print("Diagnostics:")
+        print(" - merged.head():\n", merged.head().to_string(index=False))
+        print(" - merged.tail():\n", merged.tail().to_string(index=False))
+        print("Suggestions:")
+        print(" - lower MIN_FIRMS_FOR_SE_MEAN, reduce AR_ROLL_WINDOW/SE_ROLL_WINDOW, or reduce ROLL_STD_WINDOW.")
+        print(" - increase PCA coverage (adjust PCA script: WINDOW_MONTHS, MIN_NOBS) or use batch PCA.")
+        print(" - try using raw pc1_crosssec_std (no rolling std) or smaller rolling windows (6/12 months).")
         return
 
-    X = sm.add_constant(df_reg['std_wt_24m'])
+    X = sm.add_constant(df_reg['std_unc_for_reg'])
     y = df_reg['cdi']
     model = sm.OLS(y, X).fit(cov_type='HC1')
     print(model.summary())
-    with open(os.path.join(OUT_DIR, "regression_results.txt"), "w") as f:
+    with open(os.path.join(OUT_DIR, "regression_results_using_pc1_or_stdwt.txt"), "w") as f:
         f.write(model.summary().as_text())
-    print("Saved regression results to regression_results.txt")
+    print("Saved regression results to regression_results_using_pc1_or_stdwt.txt")
 
     # scatter + fit plot
     plt.figure(figsize=(8,6))
-    plt.scatter(df_reg['std_wt_24m'], df_reg['cdi'], label='obs')
-    xs = np.linspace(df_reg['std_wt_24m'].min(), df_reg['std_wt_24m'].max(), 50)
-    ys = model.params['const'] + model.params['std_wt_24m'] * xs
+    plt.scatter(df_reg['std_unc_for_reg'], df_reg['cdi'], label='obs')
+    xs = np.linspace(df_reg['std_unc_for_reg'].min(), df_reg['std_unc_for_reg'].max(), 50)
+    ys = model.params['const'] + model.params['std_unc_for_reg'] * xs
     plt.plot(xs, ys, color='C1', label=f'fit')
-    plt.xlabel("24-month rolling std of w_t")
+    plt.xlabel("uncertainty (std_pc1_24m preferred, fallback std_wt_24m)")
     plt.ylabel("CDI (cdi)")
-    plt.title("CDI vs volatility of ensemble weight (generated wt)")
+    plt.title("CDI vs uncertainty (PCA or generated wt)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "plot_cdi_vs_stdwt_scatter.png"), dpi=150)
@@ -316,19 +365,21 @@ def main():
     fig, ax1 = plt.subplots(figsize=(10,5))
     ax1.plot(merged['date'], merged['cdi'], label='CDI', linewidth=2)
     ax2 = ax1.twinx()
-    ax2.plot(merged['date'], merged['std_wt_24m'], color='C1', label='std_wt_24m', linewidth=1.5)
-    ax1.set_xlabel('Date'); ax1.set_ylabel('CDI'); ax2.set_ylabel('std_wt_24m')
-    ax1.legend(['CDI','std_wt_24m'])
-    plt.title("CDI and 24-month rolling std of generated w_t")
+    if 'std_pc1_24m' in merged.columns:
+        ax2.plot(merged['date'], merged['std_pc1_24m'], color='C1', label='std_pc1_24m', linewidth=1.5)
+    ax2.plot(merged['date'], merged['std_wt_24m'], color='C2', label='std_wt_24m', linewidth=1.0, alpha=0.6)
+    ax1.set_xlabel('Date'); ax1.set_ylabel('CDI'); ax2.set_ylabel('std (uncertainty)')
+    lines_labels = [l.get_label() for l in ax1.get_lines()] + [l.get_label() for l in ax2.get_lines()]
+    ax1.legend(lines_labels)
+    plt.title("CDI and rolling std of uncertainty (PCA and generated wt)")
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "plot_cdi_vs_stdwt.png"), dpi=150)
     plt.close()
     print("Saved time-series plot")
 
     print("\nAll done. Output folder:", OUT_DIR)
-    print("If you want a different uncertainty-generation method, you can change AR_ROLL_WINDOW or use realized volatility instead.")
+    print("If you want different PCA / rolling settings, edit the top parameters and re-run.")
     return
 
 if __name__ == "__main__":
     main()
-
